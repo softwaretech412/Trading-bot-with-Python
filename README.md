@@ -1,0 +1,167 @@
+# QUANT Grid Trader Advisor
+
+Python trading bot that fetches trending Cardano coins (Magic Labs), pulls market data from CoinGecko, evaluates grid-trading viability, and uses an AI layer (OpenRouter) to approve or reject simulated trades.
+
+> **Note:** Order execution is **simulated** in a virtual portfolio. Real exchange API integration is not included in this version.
+
+## Requirements
+
+- Python 3.10+
+- Internet access for Magic Labs, CoinGecko, and OpenRouter APIs
+
+## Install
+
+```bash
+pip install -r requirements.txt
+```
+
+## Configuration
+
+Copy the example env file and add your API keys:
+
+```bash
+copy .env.example .env   # Windows
+# cp .env.example .env   # Linux/macOS
+```
+
+Edit `.env` with your keys. **Never commit `.env` to git.**
+
+### Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `COINGECKO_API_KEY` | Recommended | (empty) | CoinGecko API key. Without it, public rate limits apply. |
+| `MAGICLABS_JWT` | Yes | — | Magic Labs JWT for trending coins |
+| `MAGICLABS_API_KEY` | Yes | — | Magic Labs API key |
+| `OPENROUTER_API_KEY` | Yes | — | OpenRouter key for AI decisions |
+| `OPENROUTER_MODEL` | No | `minimax/minimax-m3:free` | Model ID from [openrouter.ai/models](https://openrouter.ai/models) |
+| `OPENROUTER_APP_URL` | No | GitHub repo URL | Sent as `HTTP-Referer` header |
+| `OPENROUTER_APP_NAME` | No | `QUANT Grid Trader` | Sent as `X-Title` header |
+| `SELECTED_SYMBOLS` | No | (auto) | `all`, comma-separated symbols (`LINK,SNEK`), or indices (`1,4`) |
+| `THRESHOLDS` | No | `0` for all | JSON `{"LINK":0.5}` or `LINK:0,SNEK:1` |
+| `CHECK_INTERVAL` | No | `30` | Seconds between trading cycles |
+| `MAX_API_RETRIES` | No | `5` | Max retries for CoinGecko requests |
+| `API_RETRY_BACKOFF_BASE` | No | `2` | Exponential backoff base (seconds) |
+| `LOG_LEVEL` | No | `INFO` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+
+### API key sources
+
+- CoinGecko: https://www.coingecko.com/en/api
+- Magic Labs: https://magic.link/
+- OpenRouter: https://openrouter.ai/keys
+
+## Run
+
+### Unattended / 24/7 (recommended)
+
+In scripts, CI, or Cursor, the bot auto-selects all coins with no prompts:
+
+```bash
+python quant-py-trading-bot.py
+```
+
+Optional: set symbols explicitly:
+
+```bash
+# Windows PowerShell
+$env:SELECTED_SYMBOLS="LINK,SNEK"
+python quant-py-trading-bot.py
+```
+
+### Interactive terminal
+
+Run in a real terminal **without** `SELECTED_SYMBOLS` set to be prompted for coin selection and thresholds.
+
+Stop the bot with `Ctrl+C`. Final portfolio balances are printed on shutdown.
+
+## What the bot does each cycle
+
+1. Fetch trending coins (Magic Labs)
+2. Fetch market data (CoinGecko)
+3. Compute grid strategy metrics (volatility, bounds, net step profit)
+4. Ask AI (OpenRouter) for APPROVE/REJECT per coin
+5. Execute simulated buys in a virtual USD portfolio
+6. Wait `CHECK_INTERVAL` seconds and repeat
+
+## Reading output & performance
+
+The bot uses **structured logging** to stdout:
+
+```
+[2026-09-04 08:00:01][QUANT ENGINE][INFO] API CoinGecko.markets completed in 842ms
+[2026-09-04 08:00:05][QUANT ENGINE][INFO] API OpenRouter.chat completed in 3210ms
+[2026-09-04 08:00:05][QUANT ENGINE][INFO] Cycle done in 6.45s. CPU: 12.3% | Memory: 45.2MB | Waiting 23.55s...
+```
+
+### Per-cycle metrics
+
+Each cycle logs:
+- **API latency** (ms) for Magic Labs, CoinGecko, and OpenRouter
+- **Cycle duration** (seconds)
+- **CPU %** and **memory (MB)** via `psutil`
+- **Wait time** until the next cycle
+
+Set `LOG_LEVEL=DEBUG` for more detail.
+
+### Documented latency targets
+
+| Call | Target | Notes |
+|------|--------|-------|
+| Magic Labs trending | < 3s | 15s timeout configured |
+| CoinGecko markets | < 2s | Retries on 429/5xx with backoff |
+| OpenRouter AI | < 15s | 60s timeout; falls back to rules on failure |
+| Full cycle | < `CHECK_INTERVAL` | Typically 3–10s depending on coin count |
+
+### Success indicators
+
+```
+Loaded 15 cryptocurrencies.
+Grid metrics computed for 6 coins.
+AI decisions received for 6 assets (model: minimax/minimax-m3:free).
+```
+
+### Warnings (non-fatal)
+
+| Message | Meaning |
+|---------|---------|
+| `OpenRouter model not found` | Update `OPENROUTER_MODEL` in `.env` |
+| `Insufficient credits` | Use a `:free` model or add credits |
+| `Falling back to rule-based decisions` | AI failed; uses `viable` flag instead |
+| `No market data received` | CoinGecko returned nothing; cycle skipped |
+| `Insufficient USD to buy` | Virtual portfolio balance exhausted |
+
+## Error handling
+
+- **All APIs:** Retries up to `MAX_API_RETRIES` on rate limits (429), server errors (5xx), and network faults
+- **OpenRouter:** Falls back to rule-based APPROVE/REJECT if AI fails
+- **Main loop:** Each cycle is isolated — a failure logs the error and continues on the next interval
+- **Shutdown:** Handles `Ctrl+C` (SIGINT) and `SIGTERM` for graceful exit with portfolio summary
+- **Cross-platform:** ASCII status markers (`[OK]`/`[NO]`) and UTF-8 stdout for Windows compatibility
+
+## Project layout
+
+```
+Trading Bot/
+├── quant-py-trading-bot.py   # Main application
+├── requirements.txt          # Python dependencies
+├── .env.example              # Env template (safe to commit)
+├── .env                      # Your secrets (gitignored)
+└── README.md                 # This file
+```
+
+## Security
+
+- Store all API keys in `.env` only
+- Rotate any keys that were ever committed to git
+- `.env` is listed in `.gitignore`
+
+## Limitations
+
+- Trading is **simulated** only (no real exchange orders)
+- Not all trending coins have CoinGecko market data (typically ~6 of 15)
+- `THRESHOLDS` are collected but not yet applied in buy/sell logic
+- Free OpenRouter models may rate-limit under heavy use
+
+## License
+
+Private project — see repository owner for terms.

@@ -2,10 +2,20 @@
 import os
 import sys
 import re
+import signal
+import logging
 import requests
 import json
 import time
 import yaml
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+logger = logging.getLogger("quant_engine")
+shutdown_requested = False
 
 
 def _configure_stdout():
@@ -14,6 +24,84 @@ def _configure_stdout():
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+
+def _setup_logging():
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="[%(asctime)s][QUANT ENGINE][%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def _handle_shutdown(signum, _frame):
+    global shutdown_requested
+    shutdown_requested = True
+    logger.info("Shutdown signal received (%s). Finishing gracefully...", signum)
+
+
+def _register_shutdown_handlers():
+    signal.signal(signal.SIGINT, _handle_shutdown)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _handle_shutdown)
+
+
+def _get_system_metrics():
+    if psutil is None:
+        return {}
+    proc = psutil.Process()
+    return {
+        "cpu_percent": psutil.cpu_percent(interval=0.1),
+        "memory_mb": round(proc.memory_info().rss / (1024 * 1024), 2),
+    }
+
+
+def _timed_call(service_name, func, *args, **kwargs):
+    start = time.perf_counter()
+    try:
+        result = func(*args, **kwargs)
+        latency_ms = (time.perf_counter() - start) * 1000
+        logger.info("API %s completed in %.0fms", service_name, latency_ms)
+        return result, latency_ms
+    except Exception:
+        latency_ms = (time.perf_counter() - start) * 1000
+        logger.exception("API %s failed after %.0fms", service_name, latency_ms)
+        raise
+
+
+def _http_request_with_retry(method, url, service_name, attempt=0, **kwargs):
+    try:
+        response = requests.request(method, url, **kwargs)
+        if response.status_code == 429:
+            if attempt >= MAX_API_RETRIES:
+                logger.error("%s rate limited after %s retries", service_name, MAX_API_RETRIES)
+                return None
+            wait = int(response.headers.get("Retry-After", API_RETRY_BACKOFF_BASE ** attempt))
+            logger.warning(
+                "%s rate limited. Waiting %ss (retry %s/%s)",
+                service_name, wait, attempt + 1, MAX_API_RETRIES,
+            )
+            time.sleep(wait)
+            return _http_request_with_retry(method, url, service_name, attempt + 1, **kwargs)
+        if response.status_code >= 500:
+            if attempt >= MAX_API_RETRIES:
+                logger.error("%s server error %s after %s retries", service_name, response.status_code, MAX_API_RETRIES)
+                return None
+            wait = API_RETRY_BACKOFF_BASE ** attempt
+            logger.warning("%s server error %s. Retrying in %.0fs...", service_name, response.status_code, wait)
+            time.sleep(wait)
+            return _http_request_with_retry(method, url, service_name, attempt + 1, **kwargs)
+        return response
+    except requests.exceptions.RequestException as e:
+        if attempt >= MAX_API_RETRIES:
+            logger.error("%s request failed after %s retries: %s", service_name, MAX_API_RETRIES, e)
+            return None
+        wait = API_RETRY_BACKOFF_BASE ** attempt
+        logger.warning("%s request failed (%s). Retrying in %.0fs...", service_name, e, wait)
+        time.sleep(wait)
+        return _http_request_with_retry(method, url, service_name, attempt + 1, **kwargs)
 
 
 def _load_dotenv(path=".env"):
@@ -31,6 +119,8 @@ def _load_dotenv(path=".env"):
 
 _load_dotenv()
 _configure_stdout()
+_setup_logging()
+_register_shutdown_handlers()
 
 # CONFIGURATION
 TOP_COINS_LIMIT = 20
@@ -74,64 +164,51 @@ def parse_ai_json(text):
     return json.loads(text)
 
 
-def make_coingecko_request(url, params=None, attempt=0):
+def make_coingecko_request(url, params=None):
     headers = {}
     if COINGECKO_API_KEY:
         headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
-    try:
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-        if response.status_code == 429:
-            if attempt >= MAX_API_RETRIES:
-                print(f"[-][QUANT ENGINE][ERROR] Rate limited after {MAX_API_RETRIES} retries.")
-                return None
-            wait = int(response.headers.get("Retry-After", API_RETRY_BACKOFF_BASE ** attempt))
-            print(f"[-][QUANT ENGINE][WARNING] Rate limited. Waiting {wait}s (retry {attempt + 1}/{MAX_API_RETRIES})...")
-            time.sleep(wait)
-            return make_coingecko_request(url, params, attempt + 1)
-        if response.status_code >= 500:
-            if attempt >= MAX_API_RETRIES:
-                print(f"[-][QUANT ENGINE][ERROR] Server error {response.status_code} after {MAX_API_RETRIES} retries.")
-                return None
-            wait = API_RETRY_BACKOFF_BASE ** attempt
-            print(f"[-][QUANT ENGINE][WARNING] Server error {response.status_code}. Retrying in {wait:.0f}s...")
-            time.sleep(wait)
-            return make_coingecko_request(url, params, attempt + 1)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        if attempt >= MAX_API_RETRIES:
-            print(f"[-][QUANT ENGINE][ERROR] HTTP request failed after {MAX_API_RETRIES} retries: {e}")
-            return None
-        wait = API_RETRY_BACKOFF_BASE ** attempt
-        print(f"[-][QUANT ENGINE][WARNING] Request failed ({e}). Retrying in {wait:.0f}s...")
-        time.sleep(wait)
-        return make_coingecko_request(url, params, attempt + 1)
+    response = _http_request_with_retry(
+        "GET", url, "CoinGecko", headers=headers, params=params, timeout=10,
+    )
+    if response is None or not response.ok:
+        if response is not None:
+            logger.error("CoinGecko error %s: %s", response.status_code, response.text[:200])
+        return None
+    return response.json()
+
+
+def _fetch_trending_coins():
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {MAGICLABS_JWT}",
+        "X-Magic-API-Key": MAGICLABS_API_KEY,
+        "X-Magic-Chain": "CARDANO",
+    }
+    response = _http_request_with_retry(
+        "GET",
+        "https://tee.express.magiclabs.network/v2/coins/cardano/trending",
+        "MagicLabs",
+        headers=headers,
+        timeout=15,
+    )
+    if response is None or not response.ok:
+        if response is not None:
+            logger.error("MagicLabs error %s: %s", response.status_code, response.text[:200])
+        return None
+    content_type = response.headers.get("Content-Type", "")
+    if content_type.startswith("application/json"):
+        return json.loads(response.text)
+    if content_type.startswith("application/yaml"):
+        return yaml.load(response.text, Loader=yaml.Loader)
+    return None
 
 
 def get_trending_coins():
     try:
-        # Gets list of real-time trending coins from cardano network.
-        # Uses api from https://magic.link/ preferred for accuracy.
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {MAGICLABS_JWT}",
-            "X-Magic-API-Key": MAGICLABS_API_KEY,
-            "X-Magic-Chain": "CARDANO",
-        }
-        response = requests.get(
-            "https://tee.express.magiclabs.network/v2/coins/cardano/trending",
-            headers=headers,
-            timeout=15,
-        )
-        response.raise_for_status()
-        content_type = response.headers.get("Content-Type", "")
-        if content_type.startswith("application/json"):
-            return json.loads(response.text)
-        elif content_type.startswith("application/yaml"):
-            return yaml.load(response.text, Loader=yaml.Loader)
-
-    except requests.exceptions.RequestException as e:
-        print(f"[-][QUANT ENGINE][ERROR] HTTP request failed: {e}")
+        result, _ = _timed_call("MagicLabs.trending", _fetch_trending_coins)
+        return result
+    except Exception:
         return None
 
 
@@ -145,8 +222,6 @@ def get_crypto_price(crypto_id):
 
 
 def get_market_data(coin_ids):
-    # Gets real-time market data of trending coins.
-    # Uses api from https://www.coingecko.com/ preferred for accuracy.
     if not coin_ids:
         return {}
     params = {
@@ -158,7 +233,14 @@ def get_market_data(coin_ids):
         "sparkline": False,
         "price_change_percentage": "24h,7d"
     }
-    data = make_coingecko_request("https://api.coingecko.com/api/v3/coins/markets", params)
+
+    def _fetch():
+        return make_coingecko_request("https://api.coingecko.com/api/v3/coins/markets", params)
+
+    try:
+        data, _ = _timed_call("CoinGecko.markets", _fetch)
+    except Exception:
+        return {}
     if not data:
         return {}
     result = {}
@@ -247,23 +329,7 @@ def build_structured_json(coin_id_to_data):
     return json
 
 
-def analyze_with_ai(data):
-    if not data:
-        return {}
-
-    if not OPENROUTER_API_KEY:
-        print("[-][QUANT ENGINE][WARNING] OPENROUTER_API_KEY not set. Using rule-based fallback.")
-        return _fallback_ai_decisions(data)
-
-    prompt = f"""
-You are a quantitative trading advisor. Given the following grid trading strategy parameters for multiple cryptocurrencies, evaluate each and decide whether to deploy a grid trading strategy (APPROVE) or not (REJECT) based on viability, volatility, fee drag, and trend.
-
-Data: {json.dumps(data, indent=2)}
-
-Return a JSON object with a key for each symbol and a verdict "APPROVE" or "REJECT", along with a brief reason.
-Example: {{"BTC": {{"verdict": "APPROVE", "reason": "Viable volatility and net profit positive"}}, ...}}
-Return JSON only. No markdown.
-"""
+def _call_openrouter(prompt):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -278,29 +344,57 @@ Return JSON only. No markdown.
         ],
         "max_tokens": 1024,
     }
+    response = _http_request_with_retry(
+        "POST",
+        "https://openrouter.ai/api/v1/chat/completions",
+        "OpenRouter",
+        headers=headers,
+        json=body,
+        timeout=60,
+    )
+    if response is None:
+        return None
+    if response.status_code == 404:
+        detail = response.json().get("error", {}).get("message", response.text)
+        logger.error("OpenRouter model not found: %s", detail)
+        logger.error("Update OPENROUTER_MODEL in .env (see https://openrouter.ai/models)")
+        return None
+    if response.status_code == 402:
+        logger.error("OpenRouter: insufficient credits. Use a :free model or add credits at https://openrouter.ai/credits")
+        return None
+    if not response.ok:
+        logger.error("OpenRouter error %s: %s", response.status_code, response.text[:200])
+        return None
+    return response.json()
+
+
+def analyze_with_ai(data):
+    if not data:
+        return {}
+
+    if not OPENROUTER_API_KEY:
+        logger.warning("OPENROUTER_API_KEY not set. Using rule-based fallback.")
+        return _fallback_ai_decisions(data)
+
+    prompt = f"""
+You are a quantitative trading advisor. Given the following grid trading strategy parameters for multiple cryptocurrencies, evaluate each and decide whether to deploy a grid trading strategy (APPROVE) or not (REJECT) based on viability, volatility, fee drag, and trend.
+
+Data: {json.dumps(data, indent=2)}
+
+Return a JSON object with a key for each symbol and a verdict "APPROVE" or "REJECT", along with a brief reason.
+Example: {{"BTC": {{"verdict": "APPROVE", "reason": "Viable volatility and net profit positive"}}, ...}}
+Return JSON only. No markdown.
+"""
     try:
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=body,
-            timeout=60,
-        )
-        if response.status_code == 404:
-            detail = response.json().get("error", {}).get("message", response.text)
-            print(f"[-][QUANT ENGINE][ERROR] OpenRouter model not found: {detail}")
-            print(f"[-][QUANT ENGINE][ERROR] Update OPENROUTER_MODEL in .env (see https://openrouter.ai/models)")
+        result, _ = _timed_call("OpenRouter.chat", _call_openrouter, prompt)
+        if result is None:
             return _fallback_ai_decisions(data)
-        if response.status_code == 402:
-            print("[-][QUANT ENGINE][ERROR] OpenRouter: insufficient credits. Use a :free model or add credits at https://openrouter.ai/credits")
-            return _fallback_ai_decisions(data)
-        response.raise_for_status()
-        result = response.json()
         ai_output = result["choices"][0]["message"]["content"]
         decisions = parse_ai_json(ai_output)
-        print(f"AI decisions received for {len(decisions)} assets (model: {OPENROUTER_MODEL}).")
+        logger.info("AI decisions received for %s assets (model: %s).", len(decisions), OPENROUTER_MODEL)
         return decisions
     except Exception as e:
-        print(f"[-][QUANT ENGINE][ERROR] OpenRouter error: {e}. Falling back to rule-based decisions.")
+        logger.error("OpenRouter error: %s. Falling back to rule-based decisions.", e)
         return _fallback_ai_decisions(data)
 
 
@@ -328,7 +422,7 @@ def resolve_selected_symbols(symbols, symbol_to_id):
                 if 0 <= idx < len(symbols):
                     selected.append(symbols[idx])
                 else:
-                    print(f"[-][QUANT ENGINE][WARNING] Index {part} out of range. Skipping.")
+                    logger.warning("Index %s out of range. Skipping.", part)
             return selected or symbols
         selected = []
         for part in parts:
@@ -336,13 +430,13 @@ def resolve_selected_symbols(symbols, symbol_to_id):
             if sym in symbol_to_id:
                 selected.append(sym)
             else:
-                print(f"[-][QUANT ENGINE][WARNING] Unknown symbol '{part}'. Skipping.")
+                logger.warning("Unknown symbol '%s'. Skipping.", part)
         return selected or symbols
 
     if _is_interactive():
-        print("\nAvailable Cryptocurrencies:")
+        logger.info("Available Cryptocurrencies:")
         for idx, sym in enumerate(symbols, start=1):
-            print(f"{idx}. {sym}")
+            logger.info("%s. %s", idx, sym)
         try:
             selection = input("\nEnter the numbers of the cryptocurrencies you want to track (comma-separated, or 'all' for all): ")
             if selection.lower().strip() == "all":
@@ -350,10 +444,10 @@ def resolve_selected_symbols(symbols, symbol_to_id):
             indices = [int(i.strip()) for i in selection.split(",") if i.strip()]
             return [symbols[i - 1] for i in indices if 1 <= i <= len(symbols)] or symbols
         except (ValueError, EOFError):
-            print("[-][QUANT ENGINE][WARNING] Invalid or missing input. Using all symbols.")
+            logger.warning("Invalid or missing input. Using all symbols.")
             return symbols
 
-    print("[-][QUANT ENGINE][INFO] Non-interactive mode. Using all symbols (set SELECTED_SYMBOLS to override).")
+    logger.info("Non-interactive mode. Using all symbols (set SELECTED_SYMBOLS to override).")
     return symbols
 
 
@@ -389,23 +483,85 @@ def resolve_thresholds(selected_symbols):
     return thresholds
 
 
+def _print_portfolio(portfolio):
+    logger.info("Final portfolio:")
+    for asset, balance in portfolio.items():
+        logger.info("  %s: %s", asset, balance)
+
+
+def _run_trading_cycle(selected_ids, portfolio):
+    market_data = get_market_data(selected_ids)
+    if not market_data:
+        logger.warning("No market data received. Skipping cycle.")
+        return 0
+
+    structured_data = build_structured_json(market_data)
+    logger.info("Grid metrics computed for %s coins.", len(structured_data))
+
+    for item in structured_data:
+        sym = item["symbol"]
+        name = item["name"]
+        md = item["market_data"]
+        gs = item["grid_strategy"]
+        logger.info("Asset: %s (%s)", sym, name)
+        logger.info("    Price: $%s | Volatility: %s%%", md['current_price'], md['volatility_pct'])
+        logger.info("    Grid Bounds: [$%s - $%s]", gs['suggested_lower'], gs['suggested_upper'])
+        logger.info(
+            "    Net Step Profit: %s%% [%s]",
+            gs['net_step_profit_pct'],
+            'OK' if gs['net_step_profit_pct'] > 0 else 'NO',
+        )
+        logger.info("    Distance to Lower: %s%%", gs['distance_to_lower_pct'])
+        logger.info("    7d Trend: %s%% | 24h Mom: %s%%", md['change_7d_pct'], md['change_24h_pct'])
+        logger.info("    Viable: %s", gs['viable'])
+
+    decisions = analyze_with_ai(structured_data)
+    logger.info("AI decisions ready for %s assets.", len(decisions))
+
+    executed = 0
+    for item in structured_data:
+        sym = item["symbol"]
+        if sym in decisions and decisions[sym].get("verdict") == "APPROVE":
+            usd_balance = portfolio["USD"]
+            if usd_balance >= TRADE_SIZE_USD:
+                price = item["market_data"]["current_price"]
+                amount = TRADE_SIZE_USD / price
+                portfolio["USD"] -= TRADE_SIZE_USD
+                portfolio[sym] = portfolio.get(sym, 0.0) + amount
+                logger.info(
+                    "AI APPROVED: Buying %s %s @ $%s (USD left: $%s)",
+                    f"{amount:.6f}", sym, f"{price:.2f}", f"{portfolio['USD']:.2f}",
+                )
+                executed += 1
+            else:
+                logger.warning("Insufficient USD to buy %s (balance: $%s)", sym, f"{usd_balance:.2f}")
+        else:
+            reason = decisions.get(sym, {}).get("reason", "No AI decision")
+            logger.info("AI REJECTED %s: %s", sym, reason)
+
+    logger.info("Executed %s trades this cycle.", executed)
+    return executed
+
+
 def main():
+    global shutdown_requested
 
-    print("\n==============================")
-    print("QUANT Grid Trader Advisor")
-    print("==============================\n")
-    
+    logger.info("==============================")
+    logger.info("QUANT Grid Trader Advisor")
+    logger.info("==============================")
+
     if not COINGECKO_API_KEY:
-        print("You have not provided a CoinGecko API key, falling back to using public endpoint to make requests. Modify the CHECK_INTERVAL to avoid rate-limiting.")
+        logger.warning(
+            "No CoinGecko API key set. Using public endpoint. Increase CHECK_INTERVAL to reduce rate limits."
+        )
 
-    print("Fetching real-time latest trending cryptocurrency coins...")
+    logger.info("Fetching real-time latest trending cryptocurrency coins...")
     coin_data = get_trending_coins()
 
     if not coin_data:
-        print("[-][QUANT ENGINE][ERROR] No crypto data received.")
+        logger.error("No crypto data received.")
         return
 
-    # Normalize the response into a dict {symbol: id}
     if isinstance(coin_data, dict):
         sample_keys = list(coin_data.keys())
         if sample_keys and sample_keys[0].isupper():
@@ -418,90 +574,58 @@ def main():
             if 'id' in item and 'symbol' in item:
                 symbol_to_id[item['symbol'].upper()] = item['id']
     else:
-        print("[-][QUANT ENGINE][ERROR] Unknown data format received.")
+        logger.error("Unknown data format received.")
         return
 
     if not symbol_to_id:
-        print("[-][QUANT ENGINE][ERROR] No symbol-id mapping found.")
+        logger.error("No symbol-id mapping found.")
         return
 
-    print(f"Loaded {len(symbol_to_id)} cryptocurrencies.")
+    logger.info("Loaded %s cryptocurrencies.", len(symbol_to_id))
 
     symbols = sorted(symbol_to_id.keys())
     selected_symbols = resolve_selected_symbols(symbols, symbol_to_id)
     selected_ids = [symbol_to_id[sym] for sym in selected_symbols]
-    print(f"Tracking {len(selected_ids)} coins: {', '.join(selected_symbols)}")
+    logger.info("Tracking %s coins: %s", len(selected_ids), ', '.join(selected_symbols))
 
-    thresholds = resolve_thresholds(selected_symbols)
+    resolve_thresholds(selected_symbols)
 
-    # Virtual portfolio
     portfolio = {"USD": 50000.0}
     for sym in selected_symbols:
         portfolio[sym] = 0.0
 
-    print("Starting continuous trading loop (press Ctrl+C to stop)...")
+    logger.info("Starting continuous trading loop (Ctrl+C or SIGTERM to stop)...")
 
-    try:
-        while True:
-            cycle_start = time.time()
+    while not shutdown_requested:
+        cycle_start = time.time()
+        try:
+            _run_trading_cycle(selected_ids, portfolio)
+        except Exception as e:
+            logger.error("Cycle failed unexpectedly: %s", e, exc_info=True)
 
-            market_data = get_market_data(selected_ids)
-            if not market_data:
-                print("WARNING: No market data received. Waiting...")
-                time.sleep(CHECK_INTERVAL)
-                continue
+        elapsed = time.time() - cycle_start
+        wait = max(0, CHECK_INTERVAL - elapsed)
+        metrics = _get_system_metrics()
+        if metrics:
+            logger.info(
+                "Cycle done in %.2fs. CPU: %s%% | Memory: %sMB | Waiting %.2fs...",
+                elapsed, metrics["cpu_percent"], metrics["memory_mb"], wait,
+            )
+        else:
+            logger.info("Cycle done in %.2fs. Waiting %.2fs...", elapsed, wait)
 
-            structured_data = build_structured_json(market_data)
-            print(f"Grid metrics computed for {len(structured_data)} coins.")
+        if shutdown_requested:
+            break
 
-            for item in structured_data:
-                sym = item["symbol"]
-                name = item["name"]
-                md = item["market_data"]
-                gs = item["grid_strategy"]
-                print(f"[QUANT ENGINE] Asset: {sym} ({name})")
-                print(f"    Price: ${md['current_price']} | Volatility: {md['volatility_pct']}%")
-                print(f"    Grid Bounds: [${gs['suggested_lower']} - ${gs['suggested_upper']}]")
-                print(f"    Net Step Profit: {gs['net_step_profit_pct']}% [{'OK' if gs['net_step_profit_pct'] > 0 else 'NO'}]")
-                print(f"    Distance to Lower: {gs['distance_to_lower_pct']}%")
-                print(f"    7d Trend: {md['change_7d_pct']}% | 24h Mom: {md['change_24h_pct']}%")
-                print(f"    Viable: {gs['viable']}")
-                print("---------------------------------------------------")
+        slept = 0.0
+        while slept < wait and not shutdown_requested:
+            chunk = min(1.0, wait - slept)
+            time.sleep(chunk)
+            slept += chunk
 
-            decisions = analyze_with_ai(structured_data)
-            print(f"AI decisions received for {len(decisions)} assets.")
-
-            executed = 0
-            for item in structured_data:
-                sym = item["symbol"]
-                if sym in decisions and decisions[sym].get("verdict") == "APPROVE":
-                    usd_balance = portfolio["USD"]
-                    if usd_balance >= TRADE_SIZE_USD:
-                        price = item["market_data"]["current_price"]
-                        amount = TRADE_SIZE_USD / price
-                        portfolio["USD"] -= TRADE_SIZE_USD
-                        portfolio[sym] = portfolio.get(sym, 0.0) + amount
-                        print(f"AI APPROVED: Buying {amount:.6f} {sym} @ ${price:.2f} (USD left: ${portfolio['USD']:.2f})")
-                        executed += 1
-                    else:
-                        print(f"WARNING: Insufficient USD to buy {sym} (balance: ${usd_balance:.2f})")
-                else:
-                    reason = decisions.get(sym, {}).get("reason", "No AI decision")
-                    print(f"AI REJECTED {sym}: {reason}")
-
-            print(f"Executed {executed} trades this cycle.")
-
-            elapsed = time.time() - cycle_start
-            wait = max(0, CHECK_INTERVAL - elapsed)
-            print(f"Cycle done in {elapsed:.2f}s. Waiting {wait:.2f}s...")
-            time.sleep(wait)
-
-    except KeyboardInterrupt:
-        print("Shutdown requested. Exiting gracefully.")
-        print("Final portfolio:")
-        for asset, balance in portfolio.items():
-            print(f"  {asset}: {balance}")
-        print("Goodbye.")
+    logger.info("Shutdown requested. Exiting gracefully.")
+    _print_portfolio(portfolio)
+    logger.info("Goodbye.")
 
 if __name__ == "__main__":
     main()
