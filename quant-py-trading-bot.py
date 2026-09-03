@@ -50,7 +50,9 @@ MAGICLABS_JWT = os.getenv("MAGICLABS_JWT", "")
 MAGICLABS_API_KEY = os.getenv("MAGICLABS_API_KEY", "")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "mistralai/mistral-7b-instruct")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m3:free")
+OPENROUTER_APP_URL = os.getenv("OPENROUTER_APP_URL", "https://github.com/softwaretech412/Trading-bot-with-Python")
+OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "QUANT Grid Trader")
 
 
 def _is_interactive():
@@ -249,6 +251,10 @@ def analyze_with_ai(data):
     if not data:
         return {}
 
+    if not OPENROUTER_API_KEY:
+        print("[-][QUANT ENGINE][WARNING] OPENROUTER_API_KEY not set. Using rule-based fallback.")
+        return _fallback_ai_decisions(data)
+
     prompt = f"""
 You are a quantitative trading advisor. Given the following grid trading strategy parameters for multiple cryptocurrencies, evaluate each and decide whether to deploy a grid trading strategy (APPROVE) or not (REJECT) based on viability, volatility, fee drag, and trend.
 
@@ -256,36 +262,57 @@ Data: {json.dumps(data, indent=2)}
 
 Return a JSON object with a key for each symbol and a verdict "APPROVE" or "REJECT", along with a brief reason.
 Example: {{"BTC": {{"verdict": "APPROVE", "reason": "Viable volatility and net profit positive"}}, ...}}
+Return JSON only. No markdown.
 """
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "HTTP-Referer": OPENROUTER_APP_URL,
+        "X-Title": OPENROUTER_APP_NAME,
     }
     body = {
         "model": OPENROUTER_MODEL,
         "messages": [
-            {"role": "system", "content": "You are a quantitative trading strategy evaluator."},
+            {"role": "system", "content": "You are a quantitative trading strategy evaluator. Respond with valid JSON only."},
             {"role": "user", "content": prompt}
-        ]
+        ],
+        "max_tokens": 1024,
     }
     try:
-        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=30)
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=body,
+            timeout=60,
+        )
+        if response.status_code == 404:
+            detail = response.json().get("error", {}).get("message", response.text)
+            print(f"[-][QUANT ENGINE][ERROR] OpenRouter model not found: {detail}")
+            print(f"[-][QUANT ENGINE][ERROR] Update OPENROUTER_MODEL in .env (see https://openrouter.ai/models)")
+            return _fallback_ai_decisions(data)
+        if response.status_code == 402:
+            print("[-][QUANT ENGINE][ERROR] OpenRouter: insufficient credits. Use a :free model or add credits at https://openrouter.ai/credits")
+            return _fallback_ai_decisions(data)
         response.raise_for_status()
         result = response.json()
         ai_output = result["choices"][0]["message"]["content"]
         decisions = parse_ai_json(ai_output)
-        print(f"AI decisions received for {len(decisions)} assets.")
+        print(f"AI decisions received for {len(decisions)} assets (model: {OPENROUTER_MODEL}).")
         return decisions
     except Exception as e:
-        print(f"ERROR: OpenRouter error: {e}. Falling back to mock.")
-        decisions = {}
-        for item in data:
-            sym = item["symbol"]
-            decisions[sym] = {
-                "verdict": "APPROVE" if item["grid_strategy"]["viable"] else "REJECT",
-                "reason": "Fallback due to API error"
-            }
-        return decisions
+        print(f"[-][QUANT ENGINE][ERROR] OpenRouter error: {e}. Falling back to rule-based decisions.")
+        return _fallback_ai_decisions(data)
+
+
+def _fallback_ai_decisions(data):
+    decisions = {}
+    for item in data:
+        sym = item["symbol"]
+        decisions[sym] = {
+            "verdict": "APPROVE" if item["grid_strategy"]["viable"] else "REJECT",
+            "reason": "Fallback due to API error"
+        }
+    return decisions
 
 
 def resolve_selected_symbols(symbols, symbol_to_id):
