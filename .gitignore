@@ -1,0 +1,6 @@
+.env
+run_input.txt
+__pycache__/
+*.pyc
+.venv/
+venv/
