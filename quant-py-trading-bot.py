@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 import os
+import sys
+import re
 import requests
 import json
 import time
 import yaml
+
+
+def _configure_stdout():
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 
 def _load_dotenv(path=".env"):
@@ -20,13 +30,16 @@ def _load_dotenv(path=".env"):
 
 
 _load_dotenv()
+_configure_stdout()
 
 # CONFIGURATION
 TOP_COINS_LIMIT = 20
 GRID_LEVELS = 15
 FEE_PERCENT = 0.15
 TRADE_SIZE_USD = 1000.0
-CHECK_INTERVAL = 30
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
+MAX_API_RETRIES = int(os.getenv("MAX_API_RETRIES", "5"))
+API_RETRY_BACKOFF_BASE = float(os.getenv("API_RETRY_BACKOFF_BASE", "2"))
 
 # Load from environment variables (see .env.example).
 # Register at https://www.coingecko.com/en/api to get a key.
@@ -40,23 +53,57 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "mistralai/mistral-7b-instruct")
 
 
-def make_coingecko_request(url, params=None):
+def _is_interactive():
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def parse_ai_json(text):
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        text = match.group(0)
+    return json.loads(text)
+
+
+def make_coingecko_request(url, params=None, attempt=0):
     headers = {}
     if COINGECKO_API_KEY:
         headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
     try:
         response = requests.get(url, params=params, headers=headers, timeout=10)
-        # Handle rate limiting /w retry.
         if response.status_code == 429:
-            wait = int(response.headers.get('Retry-After', 30))
-            print(f"[-][QUANT ENGINE][WARNING] Rate limited. Waiting for {wait}s...")
+            if attempt >= MAX_API_RETRIES:
+                print(f"[-][QUANT ENGINE][ERROR] Rate limited after {MAX_API_RETRIES} retries.")
+                return None
+            wait = int(response.headers.get("Retry-After", API_RETRY_BACKOFF_BASE ** attempt))
+            print(f"[-][QUANT ENGINE][WARNING] Rate limited. Waiting {wait}s (retry {attempt + 1}/{MAX_API_RETRIES})...")
             time.sleep(wait)
-            return make_coingecko_request(url, params)
+            return make_coingecko_request(url, params, attempt + 1)
+        if response.status_code >= 500:
+            if attempt >= MAX_API_RETRIES:
+                print(f"[-][QUANT ENGINE][ERROR] Server error {response.status_code} after {MAX_API_RETRIES} retries.")
+                return None
+            wait = API_RETRY_BACKOFF_BASE ** attempt
+            print(f"[-][QUANT ENGINE][WARNING] Server error {response.status_code}. Retrying in {wait:.0f}s...")
+            time.sleep(wait)
+            return make_coingecko_request(url, params, attempt + 1)
         response.raise_for_status()
         return response.json()
-    except Exception as e:
-        print(f"[-][QUANT ENGINE][ERROR] HTTP request failed: {e}")
-        return None
+    except requests.exceptions.RequestException as e:
+        if attempt >= MAX_API_RETRIES:
+            print(f"[-][QUANT ENGINE][ERROR] HTTP request failed after {MAX_API_RETRIES} retries: {e}")
+            return None
+        wait = API_RETRY_BACKOFF_BASE ** attempt
+        print(f"[-][QUANT ENGINE][WARNING] Request failed ({e}). Retrying in {wait:.0f}s...")
+        time.sleep(wait)
+        return make_coingecko_request(url, params, attempt + 1)
 
 
 def get_trending_coins():
@@ -69,8 +116,13 @@ def get_trending_coins():
             "X-Magic-API-Key": MAGICLABS_API_KEY,
             "X-Magic-Chain": "CARDANO",
         }
-        response = requests.get("https://tee.express.magiclabs.network/v2/coins/cardano/trending", headers=headers)
-        content_type = response.headers["Content-Type"]
+        response = requests.get(
+            "https://tee.express.magiclabs.network/v2/coins/cardano/trending",
+            headers=headers,
+            timeout=15,
+        )
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "")
         if content_type.startswith("application/json"):
             return json.loads(response.text)
         elif content_type.startswith("application/yaml"):
@@ -221,7 +273,7 @@ Example: {{"BTC": {{"verdict": "APPROVE", "reason": "Viable volatility and net p
         response.raise_for_status()
         result = response.json()
         ai_output = result["choices"][0]["message"]["content"]
-        decisions = json.loads(ai_output)
+        decisions = parse_ai_json(ai_output)
         print(f"AI decisions received for {len(decisions)} assets.")
         return decisions
     except Exception as e:
@@ -234,6 +286,80 @@ Example: {{"BTC": {{"verdict": "APPROVE", "reason": "Viable volatility and net p
                 "reason": "Fallback due to API error"
             }
         return decisions
+
+
+def resolve_selected_symbols(symbols, symbol_to_id):
+    env_selection = os.getenv("SELECTED_SYMBOLS", "").strip()
+    if env_selection:
+        if env_selection.lower() == "all":
+            return symbols
+        parts = [p.strip() for p in env_selection.split(",") if p.strip()]
+        if parts and all(p.isdigit() for p in parts):
+            selected = []
+            for part in parts:
+                idx = int(part) - 1
+                if 0 <= idx < len(symbols):
+                    selected.append(symbols[idx])
+                else:
+                    print(f"[-][QUANT ENGINE][WARNING] Index {part} out of range. Skipping.")
+            return selected or symbols
+        selected = []
+        for part in parts:
+            sym = part.upper()
+            if sym in symbol_to_id:
+                selected.append(sym)
+            else:
+                print(f"[-][QUANT ENGINE][WARNING] Unknown symbol '{part}'. Skipping.")
+        return selected or symbols
+
+    if _is_interactive():
+        print("\nAvailable Cryptocurrencies:")
+        for idx, sym in enumerate(symbols, start=1):
+            print(f"{idx}. {sym}")
+        try:
+            selection = input("\nEnter the numbers of the cryptocurrencies you want to track (comma-separated, or 'all' for all): ")
+            if selection.lower().strip() == "all":
+                return symbols
+            indices = [int(i.strip()) for i in selection.split(",") if i.strip()]
+            return [symbols[i - 1] for i in indices if 1 <= i <= len(symbols)] or symbols
+        except (ValueError, EOFError):
+            print("[-][QUANT ENGINE][WARNING] Invalid or missing input. Using all symbols.")
+            return symbols
+
+    print("[-][QUANT ENGINE][INFO] Non-interactive mode. Using all symbols (set SELECTED_SYMBOLS to override).")
+    return symbols
+
+
+def resolve_thresholds(selected_symbols):
+    thresholds = {sym: 0.0 for sym in selected_symbols}
+    raw = os.getenv("THRESHOLDS", "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            for sym, val in parsed.items():
+                key = sym.upper()
+                if key in thresholds:
+                    thresholds[key] = float(val)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            for part in raw.split(","):
+                if ":" not in part:
+                    continue
+                sym, val = part.split(":", 1)
+                key = sym.strip().upper()
+                if key in thresholds:
+                    try:
+                        thresholds[key] = float(val.strip())
+                    except ValueError:
+                        thresholds[key] = 0.0
+        return thresholds
+
+    if _is_interactive():
+        for sym in selected_symbols:
+            try:
+                thresholds[sym] = float(input(f"Enter {sym} buy/sell threshold (optional, press Enter to skip): ") or "0")
+            except (ValueError, EOFError):
+                thresholds[sym] = 0.0
+    return thresholds
 
 
 def main():
@@ -274,33 +400,12 @@ def main():
 
     print(f"Loaded {len(symbol_to_id)} cryptocurrencies.")
 
-    # Let user select symbols
-    print("\nAvailable Cryptocurrencies:")
     symbols = sorted(symbol_to_id.keys())
-    for idx, sym in enumerate(symbols, start=1):
-        print(f"{idx}. {sym}")
-
-    try:
-        selection = input("\nEnter the numbers of the cryptocurrencies you want to track (comma-separated, or 'all' for all): ")
-        if selection.lower().strip() == 'all':
-            selected_symbols = symbols
-        else:
-            indices = list(map(int, selection.split(',')))
-            selected_symbols = [symbols[i-1] for i in indices]
-    except ValueError:
-        print("[-][QUANT ENGINE][ERROR] Invalid input. Using all symbols.")
-        selected_symbols = symbols
-
+    selected_symbols = resolve_selected_symbols(symbols, symbol_to_id)
     selected_ids = [symbol_to_id[sym] for sym in selected_symbols]
     print(f"Tracking {len(selected_ids)} coins: {', '.join(selected_symbols)}")
 
-    # Thresholds (optional)
-    thresholds = {}
-    for sym in selected_symbols:
-        try:
-            thresholds[sym] = float(input(f"Enter {sym} buy/sell threshold (optional, press Enter to skip): ") or "0")
-        except ValueError:
-            thresholds[sym] = 0.0
+    thresholds = resolve_thresholds(selected_symbols)
 
     # Virtual portfolio
     portfolio = {"USD": 50000.0}
@@ -330,7 +435,7 @@ def main():
                 print(f"[QUANT ENGINE] Asset: {sym} ({name})")
                 print(f"    Price: ${md['current_price']} | Volatility: {md['volatility_pct']}%")
                 print(f"    Grid Bounds: [${gs['suggested_lower']} - ${gs['suggested_upper']}]")
-                print(f"    Net Step Profit: {gs['net_step_profit_pct']}% {'✅' if gs['net_step_profit_pct'] > 0 else '❌'}")
+                print(f"    Net Step Profit: {gs['net_step_profit_pct']}% [{'OK' if gs['net_step_profit_pct'] > 0 else 'NO'}]")
                 print(f"    Distance to Lower: {gs['distance_to_lower_pct']}%")
                 print(f"    7d Trend: {md['change_7d_pct']}% | 24h Mom: {md['change_24h_pct']}%")
                 print(f"    Viable: {gs['viable']}")
