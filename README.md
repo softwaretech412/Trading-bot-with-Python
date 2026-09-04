@@ -67,6 +67,19 @@ Edit `.env` with your keys. **Never commit `.env` to git.**
 | `TARGET_LATENCY_CYCLE_MS` | No | `30000` | SLO target for a full cycle |
 | `METRICS_WINDOW_SIZE` | No | `100` | Number of recent latency samples retained |
 | `METRICS_REPORT_EVERY_CYCLES` | No | `10` | How often reliability summary is logged |
+| `ALERT_COOLDOWN_SECONDS` | No | `300` | Minimum seconds between repeated alerts with same key |
+| `ALERT_SLO_BREACH_THRESHOLD` | No | `3` | Number of SLO breaches before alert is raised |
+| `ALERT_CIRCUIT_OPEN_THRESHOLD` | No | `1` | Number of circuit-open events before alert is raised |
+| `ALERT_AI_FALLBACK_THRESHOLD` | No | `2` | Number of AI fallback events before alert is raised |
+| `ALERT_LOW_USD_THRESHOLD` | No | `10000` | Alert when virtual USD balance drops below threshold |
+| `ALERT_WEBHOOK_URL` | No | (empty) | Optional webhook endpoint for external alert notifications |
+| `ALERT_WEBHOOK_TIMEOUT_SECONDS` | No | `3` | Timeout for webhook alert delivery |
+| `OPENROUTER_TEMPERATURE` | No | `0` | Locks deterministic model behavior |
+| `OPENROUTER_TOP_P` | No | `0.1` | Narrows token sampling for stable output |
+| `OPENROUTER_MAX_TOKENS` | No | `512` | Caps response size to reduce drift/latency |
+| `OPENROUTER_FREQUENCY_PENALTY` | No | `0` | Frequency penalty passed to OpenRouter |
+| `OPENROUTER_PRESENCE_PENALTY` | No | `0` | Presence penalty passed to OpenRouter |
+| `OPENROUTER_SEED` | No | `42` | Seed value for repeatable model output (provider-dependent) |
 | `LOG_LEVEL` | No | `INFO` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
 ### API key sources
@@ -84,6 +97,22 @@ In scripts, CI, or Cursor, the bot auto-selects all coins with no prompts:
 ```bash
 python quant-py-trading-bot.py
 ```
+
+### Tuned baseline profile
+
+From observed runs (CoinGecko ~= 66ms, OpenRouter ~= 4-5s, full cycle ~= 4-5s), this project now supports a conservative 24/7 profile:
+
+- `CHECK_INTERVAL=20`
+- `COINGECKO_TIMEOUT_SECONDS=6`
+- `MAGICLABS_TIMEOUT_SECONDS=10`
+- `OPENROUTER_TIMEOUT_SECONDS=20`
+- `MAX_API_RETRIES=4`
+- `API_RETRY_BACKOFF_BASE=1.8`
+- `RETRY_JITTER_SECONDS=0.5`
+- `MAX_BACKOFF_SECONDS=12`
+- `TARGET_LATENCY_COINGECKO_MS=1200`
+- `TARGET_LATENCY_OPENROUTER_MS=7000`
+- `TARGET_LATENCY_CYCLE_MS=12000`
 
 Optional: set symbols explicitly:
 
@@ -158,6 +187,9 @@ AI decisions received for 6 assets (model: minimax/minimax-m3:free).
 | `Insufficient USD to buy` | Virtual portfolio balance exhausted |
 | `SLO breach for ...` | Request/cycle exceeded target latency; tune timeouts/retries/model |
 | `circuit open` | Service hit repeated faults; requests temporarily skipped to avoid cascade failure |
+| `[ALERT][LOW_USD] ...` | Virtual cash dropped below `ALERT_LOW_USD_THRESHOLD` |
+| `[ALERT][AI_FALLBACKS] ...` | AI fallback count crossed `ALERT_AI_FALLBACK_THRESHOLD` |
+| `[ALERT][SLO_BREACH] ...` | Repeated latency breaches crossed `ALERT_SLO_BREACH_THRESHOLD` |
 
 ## Error handling
 
@@ -165,6 +197,8 @@ AI decisions received for 6 assets (model: minimax/minimax-m3:free).
 - **Backoff strategy:** Exponential backoff with jitter (`RETRY_JITTER_SECONDS`) capped by `MAX_BACKOFF_SECONDS`
 - **Circuit breaker:** Opens per-service after repeated failures and auto-recovers after cooldown
 - **OpenRouter:** Falls back to rule-based APPROVE/REJECT if AI fails
+- **Model stability controls:** Temperature/top-p/token/seed controls are configurable and pinned by default
+- **AI response validation:** Non-JSON, missing symbols, invalid verdicts, and empty reasons are normalized via safe fallback
 - **Main loop:** Each cycle is isolated — a failure logs the error and continues on the next interval
 - **Shutdown:** Handles `Ctrl+C` (SIGINT) and `SIGTERM` for graceful exit with portfolio summary
 - **Cross-platform:** ASCII status markers (`[OK]`/`[NO]`) and UTF-8 stdout for Windows compatibility

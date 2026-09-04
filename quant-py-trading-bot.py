@@ -20,6 +20,34 @@ logger = logging.getLogger("quant_engine")
 shutdown_requested = False
 
 
+class AlertManager:
+    def __init__(self):
+        self.last_alert_times = {}
+
+    def _send_webhook(self, title, message):
+        if not ALERT_WEBHOOK_URL:
+            return
+        payload = {
+            "title": title,
+            "message": message,
+            "ts": int(time.time()),
+        }
+        try:
+            requests.post(ALERT_WEBHOOK_URL, json=payload, timeout=ALERT_WEBHOOK_TIMEOUT_SECONDS)
+        except requests.exceptions.RequestException as e:
+            logger.warning("Alert webhook failed: %s", e)
+
+    def emit(self, alert_key, title, message):
+        now = time.time()
+        last = self.last_alert_times.get(alert_key, 0.0)
+        if now - last < ALERT_COOLDOWN_SECONDS:
+            return False
+        self.last_alert_times[alert_key] = now
+        logger.error("[ALERT][%s] %s", title, message)
+        self._send_webhook(title, message)
+        return True
+
+
 class RuntimeMonitor:
     def __init__(self, window_size, report_every_cycles):
         self.latencies = defaultdict(lambda: deque(maxlen=window_size))
@@ -79,6 +107,27 @@ class RuntimeMonitor:
         )
         for service_name, target_ms in SLO_TARGETS_MS.items():
             self.log_latency_slo(service_name, target_ms)
+        self._check_alert_thresholds()
+
+    def _check_alert_thresholds(self):
+        if self.counters.get("ai_fallbacks", 0) >= ALERT_AI_FALLBACK_THRESHOLD:
+            ALERTS.emit(
+                "ai_fallbacks_high",
+                "AI_FALLBACKS",
+                f"AI fallback count reached {self.counters.get('ai_fallbacks', 0)}",
+            )
+        if self.counters.get("circuit_opens", 0) >= ALERT_CIRCUIT_OPEN_THRESHOLD:
+            ALERTS.emit(
+                "circuit_opens_high",
+                "CIRCUIT_OPENS",
+                f"Circuit opened {self.counters.get('circuit_opens', 0)} times",
+            )
+
+    def get_p95(self, service_name):
+        history = list(self.latencies.get(service_name, []))
+        if not history:
+            return 0.0
+        return self._percentile(history, 0.95)
 
 
 def _configure_stdout():
@@ -134,6 +183,14 @@ def _timed_call(service_name, func, *args, **kwargs):
                 "SLO breach for %s: %.0fms (target %.0fms)",
                 service_name, latency_ms, target_ms
             )
+            MONITOR.increment("slo_breaches", service_name)
+            breach_count = MONITOR.counters.get(f"slo_breaches.{service_name}", 0)
+            if breach_count >= ALERT_SLO_BREACH_THRESHOLD:
+                ALERTS.emit(
+                    f"slo_breach_{service_name}",
+                    "SLO_BREACH",
+                    f"{service_name} breached SLO {breach_count} times (target {target_ms:.0f}ms, latest {latency_ms:.0f}ms)",
+                )
         return result, latency_ms
     except Exception:
         latency_ms = (time.perf_counter() - start) * 1000
@@ -161,6 +218,11 @@ def _register_service_failure(service_name):
             "%s circuit opened for %.1fs after repeated failures.",
             service_name,
             CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+        )
+        ALERTS.emit(
+            f"circuit_open_{service_name}",
+            "CIRCUIT_OPEN",
+            f"{service_name} circuit opened for {CIRCUIT_BREAKER_COOLDOWN_SECONDS:.1f}s after repeated failures.",
         )
 
 
@@ -267,6 +329,19 @@ METRICS_REPORT_EVERY_CYCLES = int(os.getenv("METRICS_REPORT_EVERY_CYCLES", "10")
 COINGECKO_TIMEOUT_SECONDS = float(os.getenv("COINGECKO_TIMEOUT_SECONDS", "10"))
 MAGICLABS_TIMEOUT_SECONDS = float(os.getenv("MAGICLABS_TIMEOUT_SECONDS", "15"))
 OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "60"))
+ALERT_COOLDOWN_SECONDS = float(os.getenv("ALERT_COOLDOWN_SECONDS", "300"))
+ALERT_SLO_BREACH_THRESHOLD = int(os.getenv("ALERT_SLO_BREACH_THRESHOLD", "3"))
+ALERT_CIRCUIT_OPEN_THRESHOLD = int(os.getenv("ALERT_CIRCUIT_OPEN_THRESHOLD", "1"))
+ALERT_AI_FALLBACK_THRESHOLD = int(os.getenv("ALERT_AI_FALLBACK_THRESHOLD", "2"))
+ALERT_LOW_USD_THRESHOLD = float(os.getenv("ALERT_LOW_USD_THRESHOLD", "10000"))
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
+ALERT_WEBHOOK_TIMEOUT_SECONDS = float(os.getenv("ALERT_WEBHOOK_TIMEOUT_SECONDS", "3"))
+OPENROUTER_TEMPERATURE = float(os.getenv("OPENROUTER_TEMPERATURE", "0"))
+OPENROUTER_TOP_P = float(os.getenv("OPENROUTER_TOP_P", "0.1"))
+OPENROUTER_MAX_TOKENS = int(os.getenv("OPENROUTER_MAX_TOKENS", "512"))
+OPENROUTER_FREQUENCY_PENALTY = float(os.getenv("OPENROUTER_FREQUENCY_PENALTY", "0"))
+OPENROUTER_PRESENCE_PENALTY = float(os.getenv("OPENROUTER_PRESENCE_PENALTY", "0"))
+OPENROUTER_SEED = int(os.getenv("OPENROUTER_SEED", "42"))
 
 # Load from environment variables (see .env.example).
 # Register at https://www.coingecko.com/en/api to get a key.
@@ -290,6 +365,7 @@ SLO_TARGETS_MS = {
 
 CIRCUIT_BREAKERS = {}
 MONITOR = RuntimeMonitor(METRICS_WINDOW_SIZE, METRICS_REPORT_EVERY_CYCLES)
+ALERTS = AlertManager()
 
 
 def _is_interactive():
@@ -309,6 +385,42 @@ def parse_ai_json(text):
     if match:
         text = match.group(0)
     return json.loads(text)
+
+
+def _validate_verdict(value):
+    return isinstance(value, str) and value.upper() in ("APPROVE", "REJECT")
+
+
+def normalize_ai_decisions(data, raw_decisions):
+    fallback = _fallback_ai_decisions(data)
+    if not isinstance(raw_decisions, dict):
+        logger.warning("AI decisions were not a JSON object. Using fallback decisions.")
+        MONITOR.increment("ai_validation_failures")
+        return fallback
+
+    normalized = {}
+    for item in data:
+        sym = item["symbol"]
+        candidate = raw_decisions.get(sym)
+        if not isinstance(candidate, dict):
+            normalized[sym] = fallback[sym]
+            MONITOR.increment("ai_validation_failures")
+            continue
+
+        verdict = candidate.get("verdict")
+        reason = candidate.get("reason")
+        if not _validate_verdict(verdict):
+            normalized[sym] = fallback[sym]
+            MONITOR.increment("ai_validation_failures")
+            continue
+        if not isinstance(reason, str) or not reason.strip():
+            reason = "AI reason missing; normalized"
+
+        normalized[sym] = {
+            "verdict": verdict.upper(),
+            "reason": reason.strip()[:240],
+        }
+    return normalized
 
 
 def make_coingecko_request(url, params=None):
@@ -489,7 +601,12 @@ def _call_openrouter(prompt):
             {"role": "system", "content": "You are a quantitative trading strategy evaluator. Respond with valid JSON only."},
             {"role": "user", "content": prompt}
         ],
-        "max_tokens": 1024,
+        "max_tokens": OPENROUTER_MAX_TOKENS,
+        "temperature": OPENROUTER_TEMPERATURE,
+        "top_p": OPENROUTER_TOP_P,
+        "frequency_penalty": OPENROUTER_FREQUENCY_PENALTY,
+        "presence_penalty": OPENROUTER_PRESENCE_PENALTY,
+        "seed": OPENROUTER_SEED,
     }
     response = _http_request_with_retry(
         "POST",
@@ -536,14 +653,17 @@ Return JSON only. No markdown.
         result, _ = _timed_call("OpenRouter.chat", _call_openrouter, prompt)
         if result is None:
             MONITOR.increment("ai_fallbacks")
+            _maybe_alert_ai_fallbacks()
             return _fallback_ai_decisions(data)
         ai_output = result["choices"][0]["message"]["content"]
-        decisions = parse_ai_json(ai_output)
+        raw_decisions = parse_ai_json(ai_output)
+        decisions = normalize_ai_decisions(data, raw_decisions)
         logger.info("AI decisions received for %s assets (model: %s).", len(decisions), OPENROUTER_MODEL)
         return decisions
     except Exception as e:
         logger.error("OpenRouter error: %s. Falling back to rule-based decisions.", e)
         MONITOR.increment("ai_fallbacks")
+        _maybe_alert_ai_fallbacks()
         return _fallback_ai_decisions(data)
 
 
@@ -556,6 +676,16 @@ def _fallback_ai_decisions(data):
             "reason": "Fallback due to API error"
         }
     return decisions
+
+
+def _maybe_alert_ai_fallbacks():
+    fallback_count = MONITOR.counters.get("ai_fallbacks", 0)
+    if fallback_count >= ALERT_AI_FALLBACK_THRESHOLD:
+        ALERTS.emit(
+            "ai_fallbacks_high",
+            "AI_FALLBACKS",
+            f"AI fallback count reached {fallback_count}",
+        )
 
 
 def resolve_selected_symbols(symbols, symbol_to_id):
@@ -666,6 +796,8 @@ def _run_trading_cycle(selected_ids, portfolio):
 
     decisions = analyze_with_ai(structured_data)
     logger.info("AI decisions ready for %s assets.", len(decisions))
+    if MONITOR.counters.get("ai_validation_failures", 0) > 0:
+        logger.warning("AI output normalization applied %s times so far.", MONITOR.counters.get("ai_validation_failures", 0))
 
     executed = 0
     for item in structured_data:
@@ -689,6 +821,12 @@ def _run_trading_cycle(selected_ids, portfolio):
             logger.info("AI REJECTED %s: %s", sym, reason)
 
     logger.info("Executed %s trades this cycle.", executed)
+    if portfolio.get("USD", 0.0) <= ALERT_LOW_USD_THRESHOLD:
+        ALERTS.emit(
+            "low_usd_balance",
+            "LOW_USD",
+            f"USD balance dropped to {portfolio.get('USD', 0.0):.2f} (threshold {ALERT_LOW_USD_THRESHOLD:.2f})",
+        )
     return executed
 
 
@@ -761,6 +899,14 @@ def main():
                 "SLO breach for Cycle.total: %.0fms (target %.0fms)",
                 elapsed * 1000, cycle_target
             )
+            MONITOR.increment("slo_breaches", "Cycle.total")
+            breach_count = MONITOR.counters.get("slo_breaches.Cycle.total", 0)
+            if breach_count >= ALERT_SLO_BREACH_THRESHOLD:
+                ALERTS.emit(
+                    "slo_breach_cycle_total",
+                    "SLO_BREACH",
+                    f"Cycle.total breached SLO {breach_count} times (target {cycle_target:.0f}ms, latest {elapsed * 1000:.0f}ms)",
+                )
         metrics = _get_system_metrics()
         if metrics:
             logger.info(
