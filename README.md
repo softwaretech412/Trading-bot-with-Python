@@ -11,9 +11,21 @@ Python trading bot that fetches trending Cardano coins (Magic Labs), pulls marke
 
 ## Install
 
+**Windows (PowerShell):**
+
+```powershell
+python -m pip install -r requirements.txt
+# or run the setup script (also creates .env):
+.\setup.ps1
+```
+
+**Linux/macOS:**
+
 ```bash
 pip install -r requirements.txt
 ```
+
+> On Windows, if `pip` is not recognized, use `python -m pip` instead. The project's `.vscode/settings.json` adds Python to the terminal PATH automatically in Cursor/VS Code.
 
 ## Configuration
 
@@ -40,8 +52,21 @@ Edit `.env` with your keys. **Never commit `.env` to git.**
 | `SELECTED_SYMBOLS` | No | (auto) | `all`, comma-separated symbols (`LINK,SNEK`), or indices (`1,4`) |
 | `THRESHOLDS` | No | `0` for all | JSON `{"LINK":0.5}` or `LINK:0,SNEK:1` |
 | `CHECK_INTERVAL` | No | `30` | Seconds between trading cycles |
-| `MAX_API_RETRIES` | No | `5` | Max retries for CoinGecko requests |
+| `MAX_API_RETRIES` | No | `5` | Max retries for external requests before fail/skip |
 | `API_RETRY_BACKOFF_BASE` | No | `2` | Exponential backoff base (seconds) |
+| `RETRY_JITTER_SECONDS` | No | `0.3` | Random jitter added to backoff to avoid retry storms |
+| `MAX_BACKOFF_SECONDS` | No | `30` | Hard cap for retry wait duration |
+| `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | No | `5` | Consecutive failures before a service circuit opens |
+| `CIRCUIT_BREAKER_COOLDOWN_SECONDS` | No | `60` | Cooldown duration when circuit is open |
+| `COINGECKO_TIMEOUT_SECONDS` | No | `10` | Timeout for CoinGecko HTTP requests |
+| `MAGICLABS_TIMEOUT_SECONDS` | No | `15` | Timeout for Magic Labs HTTP requests |
+| `OPENROUTER_TIMEOUT_SECONDS` | No | `60` | Timeout for OpenRouter requests |
+| `TARGET_LATENCY_MAGICLABS_MS` | No | `3000` | SLO target for Magic Labs trending call |
+| `TARGET_LATENCY_COINGECKO_MS` | No | `2000` | SLO target for CoinGecko markets call |
+| `TARGET_LATENCY_OPENROUTER_MS` | No | `15000` | SLO target for OpenRouter chat call |
+| `TARGET_LATENCY_CYCLE_MS` | No | `30000` | SLO target for a full cycle |
+| `METRICS_WINDOW_SIZE` | No | `100` | Number of recent latency samples retained |
+| `METRICS_REPORT_EVERY_CYCLES` | No | `10` | How often reliability summary is logged |
 | `LOG_LEVEL` | No | `INFO` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
 ### API key sources
@@ -100,6 +125,8 @@ Each cycle logs:
 - **Cycle duration** (seconds)
 - **CPU %** and **memory (MB)** via `psutil`
 - **Wait time** until the next cycle
+- **SLO breaches** when latest API/cycle latency exceeds configured targets
+- **Reliability summary** every `METRICS_REPORT_EVERY_CYCLES` cycles (retries, rate limits, network/server faults, circuit opens/skips, AI fallbacks)
 
 Set `LOG_LEVEL=DEBUG` for more detail.
 
@@ -129,10 +156,14 @@ AI decisions received for 6 assets (model: minimax/minimax-m3:free).
 | `Falling back to rule-based decisions` | AI failed; uses `viable` flag instead |
 | `No market data received` | CoinGecko returned nothing; cycle skipped |
 | `Insufficient USD to buy` | Virtual portfolio balance exhausted |
+| `SLO breach for ...` | Request/cycle exceeded target latency; tune timeouts/retries/model |
+| `circuit open` | Service hit repeated faults; requests temporarily skipped to avoid cascade failure |
 
 ## Error handling
 
 - **All APIs:** Retries up to `MAX_API_RETRIES` on rate limits (429), server errors (5xx), and network faults
+- **Backoff strategy:** Exponential backoff with jitter (`RETRY_JITTER_SECONDS`) capped by `MAX_BACKOFF_SECONDS`
+- **Circuit breaker:** Opens per-service after repeated failures and auto-recovers after cooldown
 - **OpenRouter:** Falls back to rule-based APPROVE/REJECT if AI fails
 - **Main loop:** Each cycle is isolated — a failure logs the error and continues on the next interval
 - **Shutdown:** Handles `Ctrl+C` (SIGINT) and `SIGTERM` for graceful exit with portfolio summary

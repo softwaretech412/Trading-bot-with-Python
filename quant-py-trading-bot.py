@@ -4,10 +4,12 @@ import sys
 import re
 import signal
 import logging
+import random
 import requests
 import json
 import time
 import yaml
+from collections import defaultdict, deque
 
 try:
     import psutil
@@ -16,6 +18,67 @@ except ImportError:
 
 logger = logging.getLogger("quant_engine")
 shutdown_requested = False
+
+
+class RuntimeMonitor:
+    def __init__(self, window_size, report_every_cycles):
+        self.latencies = defaultdict(lambda: deque(maxlen=window_size))
+        self.counters = defaultdict(int)
+        self.cycle_count = 0
+        self.report_every_cycles = max(1, report_every_cycles)
+
+    def record_latency(self, service_name, latency_ms):
+        self.latencies[service_name].append(float(latency_ms))
+
+    def increment(self, counter_name, service_name=None):
+        self.counters[counter_name] += 1
+        if service_name:
+            self.counters[f"{counter_name}.{service_name}"] += 1
+
+    def _percentile(self, values, percentile):
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        index = int((len(ordered) - 1) * percentile)
+        return ordered[index]
+
+    def log_latency_slo(self, service_name, target_ms):
+        history = list(self.latencies.get(service_name, []))
+        if not history:
+            logger.warning("SLO %s has no samples yet.", service_name)
+            return
+        p50 = self._percentile(history, 0.50)
+        p95 = self._percentile(history, 0.95)
+        latest = history[-1]
+        status = "OK" if p95 <= target_ms else "SLOW"
+        logger.info(
+            "SLO %s latest=%.0fms p50=%.0fms p95=%.0fms target=%.0fms [%s]",
+            service_name,
+            latest,
+            p50,
+            p95,
+            target_ms,
+            status,
+        )
+
+    def log_cycle_summary(self):
+        self.cycle_count += 1
+        if self.cycle_count % self.report_every_cycles != 0:
+            return
+        logger.info(
+            "Reliability summary (since startup, report interval %s cycles): retries=%s rate_limits=%s "
+            "network_errors=%s server_errors=%s circuit_opens=%s circuit_skips=%s ai_fallbacks=%s",
+            self.report_every_cycles,
+            self.counters.get("retries", 0),
+            self.counters.get("rate_limits", 0),
+            self.counters.get("network_errors", 0),
+            self.counters.get("server_errors", 0),
+            self.counters.get("circuit_opens", 0),
+            self.counters.get("circuit_skips", 0),
+            self.counters.get("ai_fallbacks", 0),
+        )
+        for service_name, target_ms in SLO_TARGETS_MS.items():
+            self.log_latency_slo(service_name, target_ms)
 
 
 def _configure_stdout():
@@ -64,42 +127,107 @@ def _timed_call(service_name, func, *args, **kwargs):
         result = func(*args, **kwargs)
         latency_ms = (time.perf_counter() - start) * 1000
         logger.info("API %s completed in %.0fms", service_name, latency_ms)
+        MONITOR.record_latency(service_name, latency_ms)
+        target_ms = SLO_TARGETS_MS.get(service_name)
+        if target_ms and latency_ms > target_ms:
+            logger.warning(
+                "SLO breach for %s: %.0fms (target %.0fms)",
+                service_name, latency_ms, target_ms
+            )
         return result, latency_ms
     except Exception:
         latency_ms = (time.perf_counter() - start) * 1000
         logger.exception("API %s failed after %.0fms", service_name, latency_ms)
+        MONITOR.increment("timed_call_exceptions", service_name)
         raise
 
 
+def _get_circuit_state(service_name):
+    state = CIRCUIT_BREAKERS.get(service_name)
+    if state is None:
+        state = {"consecutive_failures": 0, "opened_until": 0.0}
+        CIRCUIT_BREAKERS[service_name] = state
+    return state
+
+
+def _register_service_failure(service_name):
+    state = _get_circuit_state(service_name)
+    state["consecutive_failures"] += 1
+    if state["consecutive_failures"] >= CIRCUIT_BREAKER_FAILURE_THRESHOLD:
+        state["opened_until"] = time.time() + CIRCUIT_BREAKER_COOLDOWN_SECONDS
+        state["consecutive_failures"] = 0
+        MONITOR.increment("circuit_opens", service_name)
+        logger.error(
+            "%s circuit opened for %.1fs after repeated failures.",
+            service_name,
+            CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+        )
+
+
+def _register_service_success(service_name):
+    state = _get_circuit_state(service_name)
+    state["consecutive_failures"] = 0
+
+
+def _compute_backoff_seconds(attempt, retry_after=None):
+    if retry_after is not None:
+        try:
+            base_wait = max(0.0, float(retry_after))
+        except (TypeError, ValueError):
+            base_wait = API_RETRY_BACKOFF_BASE ** attempt
+    else:
+        base_wait = API_RETRY_BACKOFF_BASE ** attempt
+    jitter = random.uniform(0, RETRY_JITTER_SECONDS) if RETRY_JITTER_SECONDS > 0 else 0.0
+    return min(MAX_BACKOFF_SECONDS, base_wait + jitter)
+
+
 def _http_request_with_retry(method, url, service_name, attempt=0, **kwargs):
+    state = _get_circuit_state(service_name)
+    now = time.time()
+    if state["opened_until"] > now:
+        remaining = state["opened_until"] - now
+        MONITOR.increment("circuit_skips", service_name)
+        logger.warning("%s circuit open. Skipping call for %.1fs.", service_name, remaining)
+        return None
+
     try:
         response = requests.request(method, url, **kwargs)
         if response.status_code == 429:
+            MONITOR.increment("rate_limits", service_name)
+            _register_service_failure(service_name)
             if attempt >= MAX_API_RETRIES:
                 logger.error("%s rate limited after %s retries", service_name, MAX_API_RETRIES)
                 return None
-            wait = int(response.headers.get("Retry-After", API_RETRY_BACKOFF_BASE ** attempt))
+            wait = _compute_backoff_seconds(attempt, response.headers.get("Retry-After"))
+            MONITOR.increment("retries", service_name)
             logger.warning(
-                "%s rate limited. Waiting %ss (retry %s/%s)",
+                "%s rate limited. Waiting %.2fs (retry %s/%s)",
                 service_name, wait, attempt + 1, MAX_API_RETRIES,
             )
             time.sleep(wait)
             return _http_request_with_retry(method, url, service_name, attempt + 1, **kwargs)
         if response.status_code >= 500:
+            MONITOR.increment("server_errors", service_name)
+            _register_service_failure(service_name)
             if attempt >= MAX_API_RETRIES:
                 logger.error("%s server error %s after %s retries", service_name, response.status_code, MAX_API_RETRIES)
                 return None
-            wait = API_RETRY_BACKOFF_BASE ** attempt
-            logger.warning("%s server error %s. Retrying in %.0fs...", service_name, response.status_code, wait)
+            wait = _compute_backoff_seconds(attempt)
+            MONITOR.increment("retries", service_name)
+            logger.warning("%s server error %s. Retrying in %.2fs...", service_name, response.status_code, wait)
             time.sleep(wait)
             return _http_request_with_retry(method, url, service_name, attempt + 1, **kwargs)
+        _register_service_success(service_name)
         return response
     except requests.exceptions.RequestException as e:
+        MONITOR.increment("network_errors", service_name)
+        _register_service_failure(service_name)
         if attempt >= MAX_API_RETRIES:
             logger.error("%s request failed after %s retries: %s", service_name, MAX_API_RETRIES, e)
             return None
-        wait = API_RETRY_BACKOFF_BASE ** attempt
-        logger.warning("%s request failed (%s). Retrying in %.0fs...", service_name, e, wait)
+        wait = _compute_backoff_seconds(attempt)
+        MONITOR.increment("retries", service_name)
+        logger.warning("%s request failed (%s). Retrying in %.2fs...", service_name, e, wait)
         time.sleep(wait)
         return _http_request_with_retry(method, url, service_name, attempt + 1, **kwargs)
 
@@ -130,6 +258,15 @@ TRADE_SIZE_USD = 1000.0
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
 MAX_API_RETRIES = int(os.getenv("MAX_API_RETRIES", "5"))
 API_RETRY_BACKOFF_BASE = float(os.getenv("API_RETRY_BACKOFF_BASE", "2"))
+RETRY_JITTER_SECONDS = float(os.getenv("RETRY_JITTER_SECONDS", "0.3"))
+MAX_BACKOFF_SECONDS = float(os.getenv("MAX_BACKOFF_SECONDS", "30"))
+CIRCUIT_BREAKER_FAILURE_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5"))
+CIRCUIT_BREAKER_COOLDOWN_SECONDS = float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "60"))
+METRICS_WINDOW_SIZE = int(os.getenv("METRICS_WINDOW_SIZE", "100"))
+METRICS_REPORT_EVERY_CYCLES = int(os.getenv("METRICS_REPORT_EVERY_CYCLES", "10"))
+COINGECKO_TIMEOUT_SECONDS = float(os.getenv("COINGECKO_TIMEOUT_SECONDS", "10"))
+MAGICLABS_TIMEOUT_SECONDS = float(os.getenv("MAGICLABS_TIMEOUT_SECONDS", "15"))
+OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "60"))
 
 # Load from environment variables (see .env.example).
 # Register at https://www.coingecko.com/en/api to get a key.
@@ -143,6 +280,16 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m3:free")
 OPENROUTER_APP_URL = os.getenv("OPENROUTER_APP_URL", "https://github.com/softwaretech412/Trading-bot-with-Python")
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "QUANT Grid Trader")
+
+SLO_TARGETS_MS = {
+    "MagicLabs.trending": float(os.getenv("TARGET_LATENCY_MAGICLABS_MS", "3000")),
+    "CoinGecko.markets": float(os.getenv("TARGET_LATENCY_COINGECKO_MS", "2000")),
+    "OpenRouter.chat": float(os.getenv("TARGET_LATENCY_OPENROUTER_MS", "15000")),
+    "Cycle.total": float(os.getenv("TARGET_LATENCY_CYCLE_MS", str(CHECK_INTERVAL * 1000))),
+}
+
+CIRCUIT_BREAKERS = {}
+MONITOR = RuntimeMonitor(METRICS_WINDOW_SIZE, METRICS_REPORT_EVERY_CYCLES)
 
 
 def _is_interactive():
@@ -169,7 +316,7 @@ def make_coingecko_request(url, params=None):
     if COINGECKO_API_KEY:
         headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
     response = _http_request_with_retry(
-        "GET", url, "CoinGecko", headers=headers, params=params, timeout=10,
+        "GET", url, "CoinGecko", headers=headers, params=params, timeout=COINGECKO_TIMEOUT_SECONDS,
     )
     if response is None or not response.ok:
         if response is not None:
@@ -190,7 +337,7 @@ def _fetch_trending_coins():
         "https://tee.express.magiclabs.network/v2/coins/cardano/trending",
         "MagicLabs",
         headers=headers,
-        timeout=15,
+        timeout=MAGICLABS_TIMEOUT_SECONDS,
     )
     if response is None or not response.ok:
         if response is not None:
@@ -350,7 +497,7 @@ def _call_openrouter(prompt):
         "OpenRouter",
         headers=headers,
         json=body,
-        timeout=60,
+        timeout=OPENROUTER_TIMEOUT_SECONDS,
     )
     if response is None:
         return None
@@ -388,6 +535,7 @@ Return JSON only. No markdown.
     try:
         result, _ = _timed_call("OpenRouter.chat", _call_openrouter, prompt)
         if result is None:
+            MONITOR.increment("ai_fallbacks")
             return _fallback_ai_decisions(data)
         ai_output = result["choices"][0]["message"]["content"]
         decisions = parse_ai_json(ai_output)
@@ -395,6 +543,7 @@ Return JSON only. No markdown.
         return decisions
     except Exception as e:
         logger.error("OpenRouter error: %s. Falling back to rule-based decisions.", e)
+        MONITOR.increment("ai_fallbacks")
         return _fallback_ai_decisions(data)
 
 
@@ -605,6 +754,13 @@ def main():
 
         elapsed = time.time() - cycle_start
         wait = max(0, CHECK_INTERVAL - elapsed)
+        MONITOR.record_latency("Cycle.total", elapsed * 1000)
+        cycle_target = SLO_TARGETS_MS.get("Cycle.total")
+        if cycle_target and elapsed * 1000 > cycle_target:
+            logger.warning(
+                "SLO breach for Cycle.total: %.0fms (target %.0fms)",
+                elapsed * 1000, cycle_target
+            )
         metrics = _get_system_metrics()
         if metrics:
             logger.info(
@@ -613,6 +769,7 @@ def main():
             )
         else:
             logger.info("Cycle done in %.2fs. Waiting %.2fs...", elapsed, wait)
+        MONITOR.log_cycle_summary()
 
         if shutdown_requested:
             break
