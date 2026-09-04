@@ -90,6 +90,20 @@ Edit `.env` with your keys. **Never commit `.env` to git.**
 
 ## Run
 
+### Desktop app (recommended)
+
+Launch the multi-page desktop controller with full settings control, live logs table, and AI decision tables:
+
+```bash
+python app.py
+```
+
+Behavior:
+- Settings are editable only while stopped.
+- During runtime, settings are locked and a visible notice is shown.
+- Runtime logs stream into a searchable table view.
+- Latest AI/strategy data is grouped by coin in a dedicated table.
+
 ### Unattended / 24/7 (recommended)
 
 In scripts, CI, or Cursor, the bot auto-selects all coins with no prompts:
